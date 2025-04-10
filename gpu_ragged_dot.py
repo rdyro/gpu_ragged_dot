@@ -511,7 +511,7 @@ if __name__ == "__main__":
 
     def combined_fn(x, A, group_sizes, **kw):
         y = ragged_dot(x, A, group_sizes, **kw)
-        dx, dA = jax.grad(lambda x_, A_, gs_: jnp.sum(ragged_dot(x_, A_, gs_)), argnums=(0, 1))(x, A, group_sizes)
+        dx, dA = jax.grad(lambda x_, A_, gs_: jnp.sum(ragged_dot(x_, A_, gs_, **kw)), argnums=(0, 1))(x, A, group_sizes)
         return jnp.sum(dA) + jnp.sum(dx) + jnp.sum(y)
 
     _ = jax.jit(combined_fn)(x, A, group_sizes)
