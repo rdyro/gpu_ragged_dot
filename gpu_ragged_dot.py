@@ -32,6 +32,7 @@ DEFAULT_BLOCK_N = 64
 DEFAULT_BLOCK_K = 64
 DEFAULT_BLOCK_C = 32
 
+_cdiv = lambda a, b: pl.cdiv(a, jnp.array(b, jnp.int32))
 
 def _gpu_ragged_dot_kernel(
     # inputs
@@ -86,14 +87,14 @@ def _gpu_ragged_dot_kernel(
                 return acc + _dot_fn(x.astype(compute_dtype), A.astype(compute_dtype)).astype(acc.dtype)
 
             acc = jnp.zeros((block_c, block_n), dtype=acc_dtype)
-            acc = jax.lax.fori_loop(0, pl.cdiv(size.k, block_k), inner_compute, acc)
+            acc = jax.lax.fori_loop(0, _cdiv(size.k, block_k), inner_compute, acc)
             if A_scale_ref is not None:
                 acc = acc * pl.load(A_scale_ref, rhs_cols_idx, mask=rhs_cols_mask, other=0).astype(acc.dtype)
             acc = acc.astype(y_ref.dtype)
             pl.store(y_ref, (lhs_rows_idx, rhs_cols_idx), acc, mask=lhs_rows_mask[:, None] & rhs_cols_mask[None, :])
             return None
 
-        jax.lax.fori_loop(0, pl.cdiv(group_sz, block_c), outer_compute, None)
+        jax.lax.fori_loop(0, _cdiv(group_sz, block_c), outer_compute, None)
 
     @pl.when(pid.i == g - 1)
     def _():
@@ -107,7 +108,7 @@ def _gpu_ragged_dot_kernel(
             mask = row_mask[:, None] & col_mask[None, :]
             pl.store(y_ref, idx, jnp.zeros((block_c, block_n), dtype=y_ref.dtype), mask=mask)
 
-        jax.lax.fori_loop(0, pl.cdiv(size.m - last_offset, block_c), set_zero, None)
+        jax.lax.fori_loop(0, _cdiv(size.m - last_offset, block_c), set_zero, None)
 
 
 # main routine #########################################################################################################
@@ -252,12 +253,12 @@ def _gpu_trans_ragged_dot_kernel(
                 return acc + _dot_fn(x.astype(compute_dtype), y.astype(compute_dtype)).astype(acc.dtype)
 
             acc = jnp.zeros((block_k, block_n), dtype=acc_dtype)
-            acc = jax.lax.fori_loop(0, pl.cdiv(group_sz, block_c), inner_compute, acc)
+            acc = jax.lax.fori_loop(0, _cdiv(group_sz, block_c), inner_compute, acc)
             acc = acc.astype(y_ref.dtype)
             pl.store(A_bar_ref, (k_idx, cols_idx), acc, mask=k_mask[:, None] & cols_mask[None, :])
             return None
 
-        jax.lax.fori_loop(0, pl.cdiv(block_m, block_k), outer_compute, None)
+        jax.lax.fori_loop(0, _cdiv(block_m, block_k), outer_compute, None)
 
     @pl.when(group_sz == 0)
     def _():
@@ -513,6 +514,7 @@ if __name__ == "__main__":
         dx, dA = jax.grad(lambda x_, A_, gs_: jnp.sum(ragged_dot(x_, A_, gs_)), argnums=(0, 1))(x, A, group_sizes)
         return jnp.sum(dA) + jnp.sum(dx) + jnp.sum(y)
 
+    _ = jax.jit(combined_fn)(x, A, group_sizes)
     fn = jax.jit(tune(combined_fn, hyperparams=hyperparams, example_args=(x, A, group_sizes)))
     o = fn(x, A, group_sizes)
     o.block_until_ready()
