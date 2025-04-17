@@ -4,7 +4,7 @@ Example implementation of GPU ragged dot in [JAX
 Pallas](https://docs.jax.dev/en/latest/pallas/quickstart.html) (conforming to
 [`jax.lax.ragged_dot`](https://github.com/jax-ml/jax/blob/713ea3caa17b506a6b485224c88f35e74ff6a297/jax/_src/lax/lax.py#L2531))
 with hyperparameter auto-tuning via
-[tune-jax](https://github.com/rdyro/tune-jax). Defaults chosen for Nvidia H100.
+[tune-jax](https://github.com/rdyro/tune-jax). Defaults chosen for Nvidia H100 (but could benefit from tuning to your input shape examples, see end of file under `if __name__ == '__main__":`).
 Includes backwards pass via [jax.custom_vjp](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html).
 
 ```python
