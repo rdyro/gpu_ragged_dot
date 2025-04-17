@@ -506,7 +506,7 @@ if __name__ == "__main__":
         block_m=[32, 64, 128, 256],
         block_n=[16, 64, 128, 256],
         block_k=[16, 64, 128, 256],
-        block_c=[4, 8, 16, 32],
+        block_c=[4, 8, 16, 32, 64, 128, 256],
     )
 
     def combined_fn(x, A, group_sizes, **kw):
