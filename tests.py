@@ -1,3 +1,17 @@
+# Copyright 2025 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import itertools
 import math
 import random as pyrandom
@@ -93,7 +107,7 @@ class GMMTests(parameterized.TestCase):
 
         target_m = max(min(round(m * fill_in), m), 0)
         group_sizes = generate_group_sizes(next(keys), g=g, target_m=target_m)
-        assert group_sizes.size == rhs.shape[0], breakpoint()
+        assert group_sizes.size == rhs.shape[0]
 
         y = jax.jit(partial(ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(lhs, rhs, group_sizes)
         y_ref = jax.jit(ragged_dot_ref)(lhs, rhs, group_sizes)
@@ -126,7 +140,7 @@ class GMMTests(parameterized.TestCase):
 
         target_m = max(min(round(m * fill_in), m), 0)
         group_sizes = generate_group_sizes(next(keys), g=g, target_m=target_m)
-        assert group_sizes.size == rhs.shape[0], breakpoint()
+        assert group_sizes.size == rhs.shape[0]
 
         y = jax.jit(partial(trans_ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(
             lhs, dout, group_sizes

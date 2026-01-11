@@ -25,10 +25,11 @@ from jax.experimental.pallas import triton as plgpu
 
 CompilerParams = getattr(plgpu, "CompilerParams", getattr(plgpu, "TritonCompilerParams", None))
 if CompilerParams is None:
-    raise RuntimeError("Could not find CompilerParams in jax.experimental.pallas.triton. "
-                       "Upgrade to an newer JAX version please.")
+    raise RuntimeError(
+        "Could not find CompilerParams in `jax.experimental.pallas.triton`. Upgrade to an newer JAX version please."
+    )
 
-__all__ = ["ragged_dot", "ragged_dot_ref", "trans_ragged_dot", "trans_ragged_dot_ref"]
+__all__ = ["ragged_dot", "trans_ragged_dot"]
 
 # kernel ###############################################################################################################
 
@@ -37,6 +38,7 @@ DEFAULT_BLOCK_N = 64
 DEFAULT_BLOCK_K = 64
 
 _cdiv = lambda a, b: pl.cdiv(a, jnp.array(b, jnp.int32))
+
 
 def _gpu_ragged_dot_kernel(
     # inputs
@@ -59,13 +61,14 @@ def _gpu_ragged_dot_kernel(
     compute_dtype: Optional["jnp.dtype"] = None,
     acc_dtype: "jnp.dtype" = jnp.float32,
 ):
+    del g
     pid = namedtuple("pid", ["i", "j"])(pl.program_id(0), pl.program_id(1))
     size = namedtuple("size", ["m", "k", "n"])(m, k, n)  # pack into named tuple to not lose indices later
     group_sz = group_sizes_ref[pid.i]
     compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
 
     dim_nums = (((1,), (0,)), ((), ()))
-    _dot_fn = partial(jax.lax.dot_general, dimension_numbers=dim_nums, preferred_element_type= acc_dtype)
+    _dot_fn = partial(jax.lax.dot_general, dimension_numbers=dim_nums, preferred_element_type=acc_dtype)
 
     @pl.when(group_sz > 0)
     def _():
@@ -173,36 +176,6 @@ def _gpu_ragged_dot(
     return y
 
 
-# reference implementation #############################################################################################
-
-
-@partial(jax.jit, static_argnums=list(range(4, 12)))
-def _gpu_ragged_dot_ref(
-    x: jax.Array,
-    A: jax.Array,
-    group_sizes: jax.Array,
-    A_scale: jax.Array | None = None,
-    block_m: int = DEFAULT_BLOCK_M,  # unused, but used by the backwards pass
-    block_k: int = DEFAULT_BLOCK_K,
-    block_n: int = DEFAULT_BLOCK_N,
-    interpret: bool = False,
-    compute_dtype: Optional["jnp.dtype"] = None,
-    acc_dtype: Optional["jnp.dtype"] = jnp.float32,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
-) -> jax.Array:
-    del block_m, block_n, block_k, interpret, compute_dtype, acc_dtype, num_warps, num_stages
-    ret = jax.lax.ragged_dot(x, A, group_sizes)
-    if A_scale is not None:
-        indices = jnp.repeat(jnp.arange(A.shape[0]), group_sizes, total_repeat_length=x.shape[0])
-        A_scale = jnp.take_along_axis(A_scale, indices[:, None], 0)
-        ret = ret * A_scale
-    return ret
-
-
-# tests ################################################################################################################
-
-
 def _gpu_trans_ragged_dot_kernel(
     # inputs
     x_ref,  # [m, k]
@@ -223,8 +196,8 @@ def _gpu_trans_ragged_dot_kernel(
     compute_dtype: Optional["jnp.dtype"] = None,
     acc_dtype: "jnp.dtype" = jnp.float32,
 ):
-    assert A_bar_ref.shape == (block_k, block_n)
     del g
+    assert A_bar_ref.shape == (block_k, block_n)
     pid = namedtuple("pid", ["i", "r", "c"])(pl.program_id(0), pl.program_id(1), pl.program_id(2))
     size = namedtuple("size", ["m", "k", "n"])(m, k, n)  # pack into named tuple to not lose indices later
     group_sz = group_sizes_ref[pid.i]
@@ -256,7 +229,6 @@ def _gpu_trans_ragged_dot_kernel(
         acc = jax.lax.fori_loop(0, _cdiv(group_sz, block_m), inner_compute, acc)
         acc = acc.astype(y_ref.dtype)
         plgpu.store(A_bar_ref.at[k_idx, cols_idx], acc, mask=k_mask[:, None] & cols_mask[None, :])
-
 
     @pl.when(group_sz == 0)
     def _():
@@ -321,35 +293,6 @@ def _gpu_trans_ragged_dot(
     return y
 
 
-# reference implementation #############################################################################################
-
-
-@partial(jax.jit, static_argnums=list(range(3, 11)))
-def _gpu_trans_ragged_dot_ref(
-    x: jax.Array,
-    y: jax.Array,
-    group_sizes: jax.Array,
-    block_m: int = DEFAULT_BLOCK_M,  # shape[0] of A_i tile (block_m, block_n)
-    block_n: int = DEFAULT_BLOCK_N,  # shape[1] of A_i tile (block_m, block_n)
-    block_k: int = DEFAULT_BLOCK_K,  # how many rows in the accumulation loop over block_m
-    interpret: bool = False,
-    compute_dtype: Optional["jnp.dtype"] = None,
-    acc_dtype: Optional["jnp.dtype"] = jnp.float32,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
-) -> jax.Array:
-    del block_m, block_n, block_k, interpret, compute_dtype, acc_dtype, num_warps, num_stages
-
-    def scan_fn(i_offset, _):
-        i, offset = i_offset
-        accumulate = lambda j, acc: acc + x[j, :][:, None] @ y[j, :][None, :]
-        zero = jnp.zeros((x.shape[-1], y.shape[-1]), dtype=x.dtype)
-        Ai = jax.lax.fori_loop(offset, offset + group_sizes[i], accumulate, zero)
-        return (i + 1, offset + group_sizes[i]), Ai
-
-    return jax.lax.scan(scan_fn, (0, 0), None, length=group_sizes.shape[0])[1]
-
-
 # autodiff rules #######################################################################################################
 
 
@@ -358,7 +301,7 @@ def _get_ragged_dot(ref: bool = False, **kw):
     @wraps(_gpu_ragged_dot)
     @jax.custom_vjp
     def ragged_dot(x, A, group_sizes, A_scale):
-        return (_gpu_ragged_dot_ref if ref else _gpu_ragged_dot)(x, A, group_sizes, A_scale, **kw)
+        return _gpu_ragged_dot(x, A, group_sizes, A_scale, **kw)
 
     def ragged_dot_fwd(x, A, group_sizes, A_scale):
         return ragged_dot(x, A, group_sizes, A_scale), (x, A, group_sizes, A_scale)
@@ -377,7 +320,7 @@ def _get_ragged_dot(ref: bool = False, **kw):
     @wraps(_gpu_trans_ragged_dot)
     @jax.custom_vjp
     def trans_ragged_dot(x, A, group_sizes):
-        return (_gpu_trans_ragged_dot_ref if ref else _gpu_trans_ragged_dot)(x, A, group_sizes, **kw)
+        return _gpu_trans_ragged_dot(x, A, group_sizes, **kw)
 
     def trans_ragged_dot_fwd(x, y, group_sizes):
         return trans_ragged_dot(x, y, group_sizes), (x, y, group_sizes)
@@ -438,47 +381,6 @@ def trans_ragged_dot(
     return _trans_ragged_dot(x, y, group_sizes)
 
 
-@partial(jax.jit, static_argnums=list(range(4, 12)))
-def ragged_dot_ref(
-    x: jax.Array,  # [m, k]
-    A: jax.Array,  # [g, k, n]
-    group_sizes: jax.Array,  # [g]
-    A_scale: jax.Array | None = None,  # [g, n] or None
-    block_m: int = DEFAULT_BLOCK_M,  # unused, but used by the backwards pass
-    block_k: int = DEFAULT_BLOCK_K,
-    block_n: int = DEFAULT_BLOCK_N,
-    interpret: bool = False,
-    compute_dtype: Optional["jnp.dtype"] = None,
-    acc_dtype: Optional["jnp.dtype"] = jnp.float32,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
-) -> jax.Array:
-    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret)
-    kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
-    _ragged_dot = _get_ragged_dot(ref=True, **kw)[0]
-    return _ragged_dot(x, A, group_sizes, A_scale)
-
-
-@partial(jax.jit, static_argnums=list(range(3, 11)))
-def trans_ragged_dot_ref(
-    x: jax.Array,  # [m, k]
-    y: jax.Array,  # [m, n]
-    group_sizes: jax.Array,  # [g]
-    block_m: int = DEFAULT_BLOCK_M,  # shape[0] of A_i tile (block_m, block_n)
-    block_k: int = DEFAULT_BLOCK_K,  # how many rows in the accumulation loop over block_m
-    block_n: int = DEFAULT_BLOCK_N,  # shape[1] of A_i tile (block_m, block_n)
-    interpret: bool = False,
-    compute_dtype: Optional["jnp.dtype"] = None,
-    acc_dtype: Optional["jnp.dtype"] = jnp.float32,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
-) -> jax.Array:
-    kw = dict(block_m=block_m,  block_k=block_k, block_n=block_n, interpret=interpret)
-    kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
-    _trans_ragged_dot = _get_ragged_dot(ref=True, **kw)[1]
-    return _trans_ragged_dot(x, y, group_sizes)
-
-
 # a simple tuninig example #############################################################################################
 
 if __name__ == "__main__":
@@ -492,8 +394,9 @@ if __name__ == "__main__":
     print(f"FLOPS bound:  {2 * m * k * n / 35e12:.4e} s")
     print(f"HBM BW bound: {2 * (m * k + k * n + m * n) / 936e9:.4e} s")
     dtype = jnp.bfloat16
-    x = random.normal(next(keys), (m, k), dtype=dtype)
-    A = random.normal(next(keys), (g, k, n), dtype=dtype)
+    lhs = random.normal(next(keys), (m, k), dtype=dtype)
+    rhs = random.normal(next(keys), (g, k, n), dtype=dtype)
+    dout = random.normal(next(keys), (m, n), dtype=dtype)
 
     group_sizes = jnp.round((m - 2) * jax.nn.softmax(1e0 * random.normal(next(keys), g), -1)).astype(jnp.int32)
     while jnp.sum(group_sizes) != m:
@@ -502,73 +405,48 @@ if __name__ == "__main__":
     assert jnp.sum(group_sizes) <= m
 
     hyperparams = dict(
-        block_m=[16, 32, 64, 128, 256],
-        block_k=[16, 32, 64, 128, 256],
-        block_n=[16, 32, 64, 128, 256],
-        # block_m=32,
-        # block_n=128,
-        # block_k=64,
+        block_m=[32, 64, 128, 256],
+        block_k=[32, 64, 128, 256],
+        block_n=[32, 64, 128, 256],
     )
 
-    jax.config.update("jax_traceback_filtering", "off")
+    err_fn = lambda x, y, axis=-1: jnp.linalg.norm(x - y, axis=axis) / jnp.maximum(jnp.linalg.norm(y, axis=axis), 1e-7)
 
-    def combined_fn(x, A, group_sizes, **kw):
-        y = ragged_dot(x, A, group_sizes, **kw)
-        dx, dA = jax.grad(lambda x_, A_, gs_: jnp.sum(ragged_dot(x_, A_, gs_, **kw)), argnums=(0, 1))(x, A, group_sizes)
-        return jnp.sum(dA) + jnp.sum(dx) + jnp.sum(y)
+    # tune the fwd function ############################################################################################
+    fn = tune_jax.tune(jax.jit(ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
+    o_ref = jax.lax.ragged_dot(lhs, rhs, group_sizes)
+    o = jax.block_until_ready(fn(lhs, rhs, group_sizes))
+    with jax.profiler.trace("/tmp/profiles"):
+        for _ in range(3):
+            jax.block_until_ready(fn(lhs, rhs, group_sizes))
+    o_err = err_fn(o, o_ref)
+    print("#" * 80)
+    print(f"gmm err: {float(jnp.max(o_err)):.4e}")
+    print("#" * 80)
 
-    def combined_ref_fn(x, A, group_sizes, **kw):
-        del kw
-        y = jax.lax.ragged_dot(x, A, group_sizes)
-        dx, dA = jax.grad(lambda x_, A_, gs_: jnp.sum(jax.lax.ragged_dot(x_, A_, gs_)), argnums=(0, 1))(
-            x, A, group_sizes
+    # tune the combined trans_ragged_dot ###############################################################################
+    fn = tune_jax.tune(jax.jit(trans_ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
+    drhs = jax.block_until_ready(fn(lhs, dout, group_sizes))
+    drhs_ref = jax.vjp(lambda rhs: jax.lax.ragged_dot(lhs, rhs, group_sizes), rhs)[1](dout)[0]
+    drhs_err = err_fn(drhs, drhs_ref, axis=(-1, -2))
+
+    with jax.profiler.trace("/tmp/profiles"):
+        for _ in range(3):
+            jax.block_until_ready(fn(lhs, dout, group_sizes))
+    print("#" * 80)
+    print(f"tgmm err: {float(jnp.max(drhs_err)):.4e}")
+    print("#" * 80)
+
+    # tune combined ####################################################################################################
+    def combined_fn(lhs, rhs, group_sizes, **kw):
+        y = ragged_dot(lhs, rhs, group_sizes, **kw)
+        dlhs, drhs = jax.grad(lambda lhs_, rhs_, gs_: jnp.sum(ragged_dot(lhs_, rhs_, gs_, **kw)), argnums=(0, 1))(
+            lhs, rhs, group_sizes
         )
-        return jnp.sum(dA) + jnp.sum(dx) + jnp.sum(y)
+        return jnp.sum(drhs.astype(jnp.float32)) + jnp.sum(dlhs.astype(jnp.float32)) + jnp.sum(y.astype(jnp.float32))
 
-    r = jax.random.normal(jax.random.key(1), (m, n), dtype=dtype)
-    dA = jax.vjp(lambda A: ragged_dot(x, A, group_sizes, block_m=32, block_k=128, block_n=64), A)[1](r)[0]
-    # dA_ref = jax.vjp(lambda A: jax.lax.ragged_dot(x, A, group_sizes), A)[1](r)[0]
-    #breakpoint()
-
-    # fn = tune_jax.tune(jax.jit(ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
-    # jax.block_until_ready(fn(x, A, group_sizes))
-    # with jax.profiler.trace("/tmp/profiles"):
-    #     for _ in range(3):
-    #         jax.block_until_ready(fn(x, A, group_sizes))
-
-    # combined_fn(x, A, group_sizes, **hyperparams)
-    rhs = ragged_dot(x, A, group_sizes)
-    trans_ragged_dot(x, rhs, group_sizes, block_m=32, block_k=128, block_n=64)
-
-    ref_fn = jax.jit(lambda x, rhs, group_sizes: jax.vjp(lambda A: jax.lax.ragged_dot(x, A, group_sizes), A)[1](rhs)[0])
-    dA_ref = ref_fn(x, rhs, group_sizes)
-
-    fn = tune_jax.tune(jax.jit(trans_ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
-    dA = jax.block_until_ready(fn(x, rhs, group_sizes))
+    fn = tune_jax.tune(jax.jit(combined_fn, static_argnames=("block_m", "block_k", "block_n")), hyperparams=hyperparams)
+    jax.block_until_ready(fn(lhs, rhs, group_sizes))
     with jax.profiler.trace("/tmp/profiles"):
         for _ in range(3):
-            jax.block_until_ready(fn(x, rhs, group_sizes))
-    breakpoint()
-
-    _ = jax.jit(combined_fn)(x, A, group_sizes)
-    fn = tune_jax.tune(jax.jit(combined_fn, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
-    o = jax.block_until_ready(fn(x, A, group_sizes))
-    o_ref = jax.block_until_ready(jax.jit(combined_ref_fn)(x, A, group_sizes))
-
-    breakpoint()
-
-    with jax.profiler.trace("/tmp/profiles"):
-        for _ in range(3):
-            jax.block_until_ready(fn(x, A, group_sizes))
-    breakpoint()
-
-    fn_ = jax.jit(partial(ragged_dot, **fn.optimal_hyperparams))
-    jax.block_until_ready(fn_(x, A, group_sizes))
-    with jax.profiler.trace("/tmp/profiles"):
-        for _ in range(3):
-            jax.block_until_ready(fn_(x, A, group_sizes))
-    # o = ragged_dot(x, A, group_sizes, **fn.optimal_hyperparams)
-    # o2 = jax.lax.ragged_dot(x, A, group_sizes)
-    # err = jnp.linalg.norm(o - o2, axis=-1) / jnp.maximum(jnp.linalg.norm(o2, axis=-1), 1e-7)
-    # print(err)
-    # print(jnp.max(err))
+            jax.block_until_ready(fn(lhs, dout, group_sizes))
