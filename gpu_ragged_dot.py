@@ -13,16 +13,15 @@
 # limitations under the License.
 
 import time
-from functools import partial, lru_cache
-from typing import Optional
 from collections import namedtuple
+from functools import lru_cache, partial, wraps
+from typing import Optional
 
 import jax
 from jax import numpy as jnp
 from jax import random
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
-
 
 CompilerParams = getattr(plgpu, "CompilerParams", getattr(plgpu, "TritonCompilerParams", None))
 if CompilerParams is None:
@@ -83,35 +82,34 @@ def _gpu_ragged_dot_kernel(
             def inner_compute(k, acc):
                 inner_idx = pl.ds(k * block_k, block_k)
                 inner_mask = (k * block_k + jnp.arange(block_k)) < size.k
-                x = pl.load(
-                    x_ref, (lhs_rows_idx, inner_idx), mask=lhs_rows_mask[:, None] & inner_mask[None, :], other=0
+                x = plgpu.load(
+                    x_ref.at[lhs_rows_idx, inner_idx], mask=lhs_rows_mask[:, None] & inner_mask[None, :], other=0
                 )
-                A = pl.load(
-                    A_ref, (inner_idx, rhs_cols_idx), mask=inner_mask[:, None] & rhs_cols_mask[None, :], other=0
+                A = plgpu.load(
+                    A_ref.at[inner_idx, rhs_cols_idx], mask=inner_mask[:, None] & rhs_cols_mask[None, :], other=0
                 )
                 return acc + _dot_fn(x.astype(compute_dtype), A.astype(compute_dtype)).astype(acc.dtype)
 
             acc = jnp.zeros((block_m, block_n), dtype=acc_dtype)
             acc = jax.lax.fori_loop(0, _cdiv(size.k, block_k), inner_compute, acc)
             if A_scale_ref is not None:
-                acc = acc * pl.load(A_scale_ref, rhs_cols_idx, mask=rhs_cols_mask, other=0).astype(acc.dtype)
+                acc = acc * plgpu.load(A_scale_ref.at[rhs_cols_idx], mask=rhs_cols_mask, other=0).astype(acc.dtype)
             acc = acc.astype(y_ref.dtype)
-            pl.store(y_ref, (lhs_rows_idx, rhs_cols_idx), acc, mask=lhs_rows_mask[:, None] & rhs_cols_mask[None, :])
+            plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=lhs_rows_mask[:, None] & rhs_cols_mask[None, :])
             return None
 
         jax.lax.fori_loop(0, _cdiv(group_sz, block_m), outer_compute, None)
 
-    @pl.when(pid.i == g - 1)
+    @pl.when(pid.i == group_sizes_ref.size)
     def _():
-        assert group_offset_ref.size == g
-        last_offset = group_offset_ref[g - 1]
+        last_offset = group_offset_ref[-1]
         col_mask = (block_n * pid.j + jnp.arange(block_n)) < size.n
 
         def set_zero(i, _):
             row_mask = (last_offset + i * block_m + jnp.arange(block_m)) < size.m
             idx = (pl.ds(last_offset + i * block_m, block_m), pl.ds(0, block_n))
             mask = row_mask[:, None] & col_mask[None, :]
-            pl.store(y_ref, idx, jnp.zeros((block_m, block_n), dtype=y_ref.dtype), mask=mask)
+            plgpu.store(y_ref.at[*idx], jnp.zeros((block_m, block_n), dtype=y_ref.dtype), mask=mask)
 
         jax.lax.fori_loop(0, _cdiv(size.m - last_offset, block_m), set_zero, None)
 
@@ -139,7 +137,7 @@ def _gpu_ragged_dot(
     assert A.shape[:1] == group_sizes.shape
     if A_scale is not None:
         assert A_scale.shape == (A.shape[0], A.shape[-1])  # one scale per A column
-    size = namedtuple("size", ["m", "k", "n", "g"])(x.shape[0], x.shape[-1], A.shape[-1], A.shape[0])
+    size = namedtuple("size", ["m", "k", "n", "g"])(x.shape[0], x.shape[1], A.shape[-1], A.shape[0])
 
     # normalize the block sizes for GPU
     block_m, block_k, block_n = [
@@ -240,8 +238,6 @@ def _gpu_trans_ragged_dot_kernel(
         # row index into lhs and output
         start_ridx = jnp.where(pid.i == 0, 0, group_offset_ref[jnp.maximum(pid.i - 1, 0)])
 
-        #def outer_compute(k, _):
-
         k_idx = pl.ds(0, block_k)
         k_mask = (pid.r * block_m + jnp.arange(block_k)) < size.k
         cols_idx = pl.ds(0, block_n)
@@ -252,24 +248,21 @@ def _gpu_trans_ragged_dot_kernel(
             xy_rows_mask = (r_offset * block_m + jnp.arange(block_m)) < group_sz
             xy_rows_idx = pl.ds(ridx, block_m)
 
-            x = pl.load(x_ref, (xy_rows_idx, k_idx), mask=xy_rows_mask[:, None] & k_mask[None, :], other=0)
-            y = pl.load(y_ref, (xy_rows_idx, cols_idx), mask=xy_rows_mask[:, None] & cols_mask[None, :], other=0)
+            x = plgpu.load(x_ref.at[xy_rows_idx, k_idx], mask=xy_rows_mask[:, None] & k_mask[None, :], other=0)
+            y = plgpu.load(y_ref.at[xy_rows_idx, cols_idx], mask=xy_rows_mask[:, None] & cols_mask[None, :], other=0)
             return acc + _dot_fn(x.astype(compute_dtype), y.astype(compute_dtype)).astype(acc.dtype)
 
         acc = jnp.zeros((block_k, block_n), dtype=acc_dtype)
         acc = jax.lax.fori_loop(0, _cdiv(group_sz, block_m), inner_compute, acc)
         acc = acc.astype(y_ref.dtype)
-        pl.store(A_bar_ref, (k_idx, cols_idx), acc, mask=k_mask[:, None] & cols_mask[None, :])
+        plgpu.store(A_bar_ref.at[k_idx, cols_idx], acc, mask=k_mask[:, None] & cols_mask[None, :])
 
-        #return None
-
-        #jax.lax.fori_loop(0, _cdiv(block_m, block_k), outer_compute, None)
 
     @pl.when(group_sz == 0)
     def _():
         rmask = (pid.r * block_k + jnp.arange(block_k)) < size.k
         cmask = (pid.c * block_n + jnp.arange(block_n)) < size.n
-        pl.store(A_bar_ref, (pl.ds(None), pl.ds(None)), jnp.zeros_like(A_bar_ref), mask=rmask[:, None] & cmask[None, :])
+        plgpu.store(A_bar_ref, jnp.zeros_like(A_bar_ref), mask=rmask[:, None] & cmask[None, :])
 
 
 # main routine #########################################################################################################
@@ -362,6 +355,7 @@ def _gpu_trans_ragged_dot_ref(
 
 @lru_cache
 def _get_ragged_dot(ref: bool = False, **kw):
+    @wraps(_gpu_ragged_dot)
     @jax.custom_vjp
     def ragged_dot(x, A, group_sizes, A_scale):
         return (_gpu_ragged_dot_ref if ref else _gpu_ragged_dot)(x, A, group_sizes, A_scale, **kw)
@@ -380,6 +374,7 @@ def _get_ragged_dot(ref: bool = False, **kw):
 
     # --------------------------------------------------------------------- #
 
+    @wraps(_gpu_trans_ragged_dot)
     @jax.custom_vjp
     def trans_ragged_dot(x, A, group_sizes):
         return (_gpu_trans_ragged_dot_ref if ref else _gpu_trans_ragged_dot)(x, A, group_sizes, **kw)
@@ -492,8 +487,8 @@ if __name__ == "__main__":
     tune_jax.logger.setLevel("DEBUG")
 
     keys = iter(random.split(random.key(time.time_ns() % 2**31), 1024))
-    m, k, n = (4096, 7168, 2048)
-    g = 256
+    m, k, n = (2 * 4096, 7168, 2048)
+    g = 32
     print(f"FLOPS bound:  {2 * m * k * n / 35e12:.4e} s")
     print(f"HBM BW bound: {2 * (m * k + k * n + m * n) / 936e9:.4e} s")
     dtype = jnp.bfloat16
@@ -535,14 +530,25 @@ if __name__ == "__main__":
     # dA_ref = jax.vjp(lambda A: jax.lax.ragged_dot(x, A, group_sizes), A)[1](r)[0]
     #breakpoint()
 
-    fn = tune_jax.tune(jax.jit(ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
-    jax.block_until_ready(fn(x, A, group_sizes))
-    with jax.profiler.trace("/tmp/profiles"):
-        for _ in range(3):
-            jax.block_until_ready(fn(x, A, group_sizes))
+    # fn = tune_jax.tune(jax.jit(ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
+    # jax.block_until_ready(fn(x, A, group_sizes))
+    # with jax.profiler.trace("/tmp/profiles"):
+    #     for _ in range(3):
+    #         jax.block_until_ready(fn(x, A, group_sizes))
 
     # combined_fn(x, A, group_sizes, **hyperparams)
-    trans_ragged_dot(x, jnp.ones((m, n), dtype=dtype), group_sizes, block_m=32, block_k=128, block_n=64)
+    rhs = ragged_dot(x, A, group_sizes)
+    trans_ragged_dot(x, rhs, group_sizes, block_m=32, block_k=128, block_n=64)
+
+    ref_fn = jax.jit(lambda x, rhs, group_sizes: jax.vjp(lambda A: jax.lax.ragged_dot(x, A, group_sizes), A)[1](rhs)[0])
+    dA_ref = ref_fn(x, rhs, group_sizes)
+
+    fn = tune_jax.tune(jax.jit(trans_ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
+    dA = jax.block_until_ready(fn(x, rhs, group_sizes))
+    with jax.profiler.trace("/tmp/profiles"):
+        for _ in range(3):
+            jax.block_until_ready(fn(x, rhs, group_sizes))
+    breakpoint()
 
     _ = jax.jit(combined_fn)(x, A, group_sizes)
     fn = tune_jax.tune(jax.jit(combined_fn, static_argnames=hyperparams.keys()), hyperparams=hyperparams, sample_num=1e9)
