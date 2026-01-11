@@ -14,6 +14,7 @@
 
 import itertools
 import math
+import os
 import random as pyrandom
 from functools import partial
 
@@ -71,8 +72,11 @@ def generate_inputs(key: jax.Array, m: int, k: int, n: int, g: int, dtype: jnp.d
 
 
 @partial(jax.jit, static_argnames=("axis",))
-def err_fn(a: jax.Array, b: jax.Array, axis: int = -1):
-    return jnp.linalg.norm(a - b, axis=axis) / jnp.maximum(jnp.linalg.norm(b, axis=axis), 1e-7)
+def err_fn(a: jax.Array, b: jax.Array, axis: int = -1, *, mask: jax.Array | None = None):
+    err = jnp.linalg.norm(a - b, axis=axis) / jnp.maximum(jnp.linalg.norm(b, axis=axis), 1e-7)
+    if mask is not None:
+        return jnp.where(jnp.expand_dims(mask, range(mask.ndim, err.ndim)), err, 0)
+    return err
 
 
 def _sampled_product(samples, **kw):
@@ -84,73 +88,100 @@ def _sampled_product(samples, **kw):
     return parameterized.parameters(*params)
 
 
+cases_wrapper = _sampled_product(
+    os.getenv("TEST_SAMPLES", 32),
+    dtype=[jnp.bfloat16, jnp.float32],
+    m=[128, 256, 171],
+    k=[256, 512, 58],
+    n=[64, 128, 77],
+    g=[8, 16],
+    block_m=[16, 32, 64],
+    block_k=[16, 32, 64],
+    block_n=[16, 32, 64],
+    fill_in=[1.0, 0.7, 0.5],
+    # fill_in=[1.0],
+    seed=[0, 1],
+    # dtype=[jnp.float32],
+    # m=[256],
+    # k=[58],
+    # n=[64],
+    # g=[16],
+    # block_m=[16],
+    # block_k=[32],
+    # block_n=[32],
+    # fill_in=[1.0],
+    # seed=[0],
+)
+
+
 class GMMTests(parameterized.TestCase):
-    @_sampled_product(
-        64,
-        dtype=[jnp.bfloat16, jnp.float32],
-        m=[128, 256, 171],
-        k=[256, 512, 58],
-        n=[64, 128, 77],
-        g=[8, 16],
-        block_m=[16, 32, 64],
-        block_k=[16, 32, 64],
-        block_n=[16, 32, 64],
-        fill_in=[1.0, 0.7, 0.5],
-        seed=[0, 1],
-    )
-    def test_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed):
+    def generate_inputs(self, seed, m, k, n, g, fill_in, dtype):
         keys = iter(jax.random.split(jax.random.key(seed), 1024))
         lhs, rhs, dout = generate_inputs(next(keys), m=m, k=k, n=n, g=g, dtype=dtype)
-
         if "gpu" not in list(lhs.devices())[0].platform.lower():
             self.skipTest("Test requires a GPU")
-
         target_m = max(min(round(m * fill_in), m), 0)
         group_sizes = generate_group_sizes(next(keys), g=g, target_m=target_m)
         assert group_sizes.size == rhs.shape[0]
+        return lhs, rhs, dout, group_sizes, target_m
 
+    @cases_wrapper
+    def test_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed):
+        lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(seed, m, k, n, g, fill_in, dtype)
         y = jax.jit(partial(ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(lhs, rhs, group_sizes)
         y_ref = jax.jit(ragged_dot_ref)(lhs, rhs, group_sizes)
-        mask = (jnp.arange(m) < target_m)[:, None]
-        y = jnp.where(mask, y, 0.0)
-        y_ref = jnp.where(mask, y_ref, 0.0)
-
-        err = err_fn(y, y_ref, axis=-1)
+        err = err_fn(y, y_ref, axis=-1, mask=jnp.arange(m) < target_m)
         eps = 5e-3 if jnp.dtype(dtype).name == "bfloat16" else 5e-4
         self.assertLess(jnp.max(err), eps)
 
-    @_sampled_product(
-        64,
-        dtype=[jnp.bfloat16, jnp.float32],
-        m=[128, 256, 171],
-        k=[256, 512, 58],
-        n=[64, 128, 77],
-        g=[8, 16],
-        block_m=[16, 32, 64],
-        block_k=[16, 32, 64],
-        block_n=[16, 32, 64],
-        fill_in=[1.0, 0.7, 0.5],
-        seed=[0, 1],
-    )
+    @cases_wrapper
+    def test_ragged_dot_diff(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed):
+        lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(seed, m, k, n, g, fill_in, dtype)
+        o, vjp_fn = jax.vjp(
+            partial(ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n, group_sizes=group_sizes), lhs, rhs
+        )
+        o_ref, vjp_ref_fn = jax.vjp(partial(ragged_dot_ref, group_sizes=group_sizes), lhs, rhs)
+        dlhs, drhs = vjp_fn(dout)
+        dlhs_ref, drhs_ref = vjp_ref_fn(dout)
+        o_err = err_fn(o, o_ref, axis=-1, mask=jnp.arange(m) < target_m)
+        dlhs_err = err_fn(dlhs, dlhs_ref, axis=-1, mask=jnp.arange(m) < target_m)
+        drhs_err = err_fn(drhs, drhs_ref, axis=(-1, -2), mask=group_sizes == 0)
+        eps = 5e-3 if jnp.dtype(dtype).name == "bfloat16" else 5e-4
+        self.assertLess(jnp.max(o_err), eps)
+        self.assertLess(jnp.max(dlhs_err), eps)
+        self.assertLess(jnp.max(drhs_err), eps)
+
+    @cases_wrapper
+    def test_ragged_dot_diff_with_trans_A(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed):
+        lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(seed, m, k, n, g, fill_in, dtype)
+        rhs = rhs.mT
+        o, vjp_fn = jax.vjp(
+            partial(
+                ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n, group_sizes=group_sizes, trans_rhs=True
+            ),
+            lhs,
+            rhs,
+        )
+        o_ref, vjp_ref_fn = jax.vjp(partial(ragged_dot_ref, group_sizes=group_sizes), lhs, rhs.mT)
+        dlhs, drhs = vjp_fn(dout)
+        dlhs_ref, drhs_ref = vjp_ref_fn(dout)
+        drhs_ref = drhs_ref.mT
+        o_err = err_fn(o, o_ref, axis=-1, mask=jnp.arange(m) < target_m)
+        dlhs_err = err_fn(dlhs, dlhs_ref, axis=-1, mask=jnp.arange(m) < target_m)
+        drhs_err = err_fn(drhs, drhs_ref, axis=(-1, -2), mask=group_sizes == 0)
+        eps = 5e-3 if jnp.dtype(dtype).name == "bfloat16" else 5e-4
+        self.assertLess(jnp.max(o_err), eps)
+        self.assertLess(jnp.max(dlhs_err), eps)
+        self.assertLess(jnp.max(drhs_err), eps)
+
+    @cases_wrapper
     def test_trans_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed):
-        keys = iter(jax.random.split(jax.random.key(seed), 1024))
-        lhs, rhs, dout = generate_inputs(next(keys), m=m, k=k, n=n, g=g, dtype=dtype)
-        if "gpu" not in list(lhs.devices())[0].platform.lower():
-            self.skipTest("Test requires a GPU")
-
-        target_m = max(min(round(m * fill_in), m), 0)
-        group_sizes = generate_group_sizes(next(keys), g=g, target_m=target_m)
-        assert group_sizes.size == rhs.shape[0]
-
+        lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(seed, m, k, n, g, fill_in, dtype)
         y = jax.jit(partial(trans_ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(
             lhs, dout, group_sizes
         )
         y_ref = jax.jit(trans_ragged_dot_ref)(lhs, dout, group_sizes)
-        mask = (group_sizes == 0)[:, None, None]
-        y = jnp.where(mask, y, 0.0)
-        y_ref = jnp.where(mask, y_ref, 0.0)
-
-        err = err_fn(y, y_ref, axis=(-1, -2))
+        err = err_fn(y, y_ref, axis=(-1, -2), mask=group_sizes == 0)
         eps = 2e-3 if jnp.dtype(dtype).name == "bfloat16" else 1e-5
         self.assertLess(jnp.max(err), eps)
 
