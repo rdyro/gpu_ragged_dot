@@ -99,18 +99,7 @@ cases_wrapper = _sampled_product(
     block_k=[16, 32, 64],
     block_n=[16, 32, 64],
     fill_in=[1.0, 0.7, 0.5],
-    # fill_in=[1.0],
     seed=[0, 1],
-    # dtype=[jnp.float32],
-    # m=[256],
-    # k=[58],
-    # n=[64],
-    # g=[16],
-    # block_m=[16],
-    # block_k=[32],
-    # block_n=[32],
-    # fill_in=[1.0],
-    # seed=[0],
 )
 
 
