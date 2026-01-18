@@ -99,6 +99,7 @@ cases_wrapper = _sampled_product(
     block_k=[16, 32, 64],
     block_n=[16, 32, 64],
     fill_in=[1.0, 0.7, 0.5],
+    # fill_in=[1.0],
     seed=[0, 1],
 )
 

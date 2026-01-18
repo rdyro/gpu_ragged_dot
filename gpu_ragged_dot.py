@@ -35,10 +35,16 @@ DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
 DEFAULT_BLOCK_K = 64
 
+# in the simplest strategy, each of our kernel invocation attempts to handle one full group
+# but for very large group sizes with few groups, each kernel invocation would do a lot of work
+# we chunk within group to remedy that and increase the number of SMs that can work on each group
+# this "chunk" is not really tunable and it'll be further tiled with block_m, but it splits up large groups
+CHUNK_M = 512  # block size to chunk rows into to increase SM participation for very large groups
+
 cdiv = lambda a, b: pl.cdiv(a, jnp.array(b, a.dtype) if isinstance(a, jax.Array) else b)
 
 
-class ProblemSizes(NamedTuple):
+class RaggedDotSizes(NamedTuple):
     m: int
     k: int
     n: int
@@ -51,23 +57,62 @@ class BlockSizes(NamedTuple):
     n: int
 
 
+class GMMGroupLookupMetadata(NamedTuple):
+    """Metadata for splitting large groups into smaller chunks for ragged_dot, trans_ragged_dot doesn't use this."""
+
+    group_sizes: jax.Array  # the regular group sizes
+    group_offsets: jax.Array  # the group offsets
+    row_it2group: jax.Array  # mapping between gmm (i
+    row_it2it_in_group: jax.Array
+    total_row_its: jax.Array
+
+
+def _make_gmm_group_metadata(group_sizes: jax.Array, m: int, chunk_m: int) -> GMMGroupLookupMetadata:
+    """Split large groups into chunks to let several SMs work on one group. For ragged_dot, not trans_ragged_dot."""
+    g: int = group_sizes.size
+    blocks_per_group = (group_sizes + chunk_m - 1) // chunk_m  # ceil div of group sizes into chunks
+
+    # temporary variables to ragged concat group metadata into a single flat vector via 2D shifted construction + reduce
+    _blocks_offset = jnp.cumsum(blocks_per_group) - blocks_per_group
+    _blocks_upper_bound = (m + chunk_m - 1) // chunk_m + g
+    _group_iota = jnp.arange(_blocks_upper_bound)[None, :] - _blocks_offset[:, None]
+    _group_write_mask = (_group_iota >= 0) & (_group_iota < blocks_per_group[:, None])
+
+    row_it2group = jnp.sum(jnp.where(_group_write_mask, jnp.arange(g)[:, None], 0), 0)  # block row i to group id
+    row_it2it_in_group = jnp.sum(jnp.where(_group_write_mask, _group_iota, 0), 0)  # block row i to within group chunk
+
+    return GMMGroupLookupMetadata(
+        group_sizes=group_sizes,
+        group_offsets=jnp.cumsum(group_sizes) - group_sizes,
+        row_it2group=row_it2group,
+        row_it2it_in_group=row_it2it_in_group,
+        total_row_its=jnp.sum(blocks_per_group),
+    )
+
+
 def _gpu_ragged_dot_kernel(
     # inputs
     x_ref,  # [m, k]
     A_ref,  # [k, n] or [n, k]
-    group_sizes_ref,  # [g]
-    group_offset_ref,  # [g]
+    group_metadata_ref: GMMGroupLookupMetadata,
     # outputs
     y_ref,  # [k, n]
     # static problem shapes
+    chunk_m: int,
     trans_rhs: bool,
-    size: ProblemSizes,
+    size: RaggedDotSizes,
     block: BlockSizes,  # hyperparameters
     compute_dtype: Optional["jnp.dtype"] = None,
     acc_dtype: "jnp.dtype" = jnp.float32,
 ):
-    pid = namedtuple("pid", ["gi", "j"])(pl.program_id(0), pl.program_id(1))
-    group_sz = group_sizes_ref[pid.gi]
+    pid = namedtuple("pid", ["i", "j", "gi"])(
+        pl.program_id(0), pl.program_id(1), group_metadata_ref.row_it2group[pl.program_id(0)]
+    )
+
+    local_inc = chunk_m * group_metadata_ref.row_it2it_in_group[pid.i]
+    valid = pid.i < group_metadata_ref.total_row_its[...]
+    group_sz = jnp.where(valid, jnp.clip(group_metadata_ref.group_sizes[pid.gi] - local_inc, min=0, max=chunk_m), 0)
+
     compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
 
     dim_nums = (((1,), (0,)), ((), ())) if not trans_rhs else (((1,), (1,)), ((), ()))
@@ -76,7 +121,7 @@ def _gpu_ragged_dot_kernel(
     @pl.when(group_sz > 0)
     def _():
         # row index into lhs and output
-        start_ridx = jnp.where(pid.gi == 0, 0, group_offset_ref[jnp.maximum(pid.gi - 1, 0)])
+        start_ridx = group_metadata_ref.group_offsets[pid.gi] + local_inc
 
         def outer_compute(r_offset, _):
             ridx = start_ridx + r_offset * block.m  # r_offset is 0,1,2,... need to map it to actual row indices
@@ -104,9 +149,10 @@ def _gpu_ragged_dot_kernel(
 
         jax.lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
 
-    last_offset = group_offset_ref[size.g - 1]
+    # zero out memory past sum(group_sizes) if we're the last kernel along m
+    last_offset = group_metadata_ref.group_offsets[size.g - 1] + group_metadata_ref.group_sizes[size.g - 1]
 
-    @pl.when((pid.gi == size.g - 1) & (last_offset < size.m))
+    @pl.when((pid.i == group_metadata_ref.total_row_its[...] - 1) & (last_offset < size.m))
     def _():
         col_mask = (block.n * pid.j + jnp.arange(block.n)) < size.n
 
@@ -141,32 +187,34 @@ def _gpu_ragged_dot_fwd(
     assert A.ndim == 3 and x.ndim == 2, f"but {A.ndim=} {x.ndim=}"
     assert A.shape[:1] == group_sizes.shape
     n = A.shape[-1] if not trans_rhs else A.shape[-2]
-    size = ProblemSizes(m=x.shape[0], k=x.shape[1], n=n, g=A.shape[0])
+    size = RaggedDotSizes(m=x.shape[0], k=x.shape[1], n=n, g=A.shape[0])
 
     # normalize the block sizes for GPU
     block_m, block_k, block_n = [
         pl.next_power_of_2(min(b, s)) for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n])
     ]
     block_k, block_n = max(block_k, 16), max(block_n, 16)
-    group_offsets = jnp.cumsum(group_sizes, -1)
 
     A_spec = pl.BlockSpec((None, size.k, block_n), lambda i, j: (i, 0, j))
     if trans_rhs:  # transposed spec
         A_spec = pl.BlockSpec((None, block_n, size.k), lambda i, j: (i, j, 0))
+
+    chunk_m = CHUNK_M
+    group_metadata = _make_gmm_group_metadata(group_sizes=group_sizes, m=size.m, chunk_m=chunk_m)
     in_specs = [
         pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
         A_spec,
-        pl.BlockSpec((group_sizes.size,), lambda i, j: (0,)),
-        pl.BlockSpec((group_offsets.size,), lambda i, j: (0,)),
+        jax.tree.map(lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim), group_metadata),
     ]
     out_shape = jax.ShapeDtypeStruct((size.m, size.n), dtype=x.dtype)
     out_specs = pl.BlockSpec((size.m, block_n), lambda i, j: (0, j))
-    grid = (size.g, pl.cdiv(size.n, block_n))
+    grid_upper_bound = (size.m + chunk_m - 1) // chunk_m + size.g
+    grid = (grid_upper_bound, pl.cdiv(size.n, block_n))
     block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
-    dtype_spec = dict(compute_dtype=compute_dtype, acc_dtype=acc_dtype)
+    other_kws = dict(compute_dtype=compute_dtype, acc_dtype=acc_dtype, trans_rhs=trans_rhs, chunk_m=chunk_m)
     with jax.named_scope("gpu_ragged_dot"):
         y = pl.pallas_call(
-            partial(_gpu_ragged_dot_kernel, size=size, block=block_sizes, **dtype_spec, trans_rhs=trans_rhs),
+            partial(_gpu_ragged_dot_kernel, size=size, block=block_sizes, **other_kws),
             out_shape=out_shape,
             grid=grid,
             in_specs=in_specs,
@@ -174,7 +222,7 @@ def _gpu_ragged_dot_fwd(
             interpret=interpret,
             compiler_params=CompilerParams(num_warps=num_warps, num_stages=num_stages),  # ty: ignore[call-non-callable]
             name="gpu_ragged_dot",
-        )(x, A, group_sizes, group_offsets)
+        )(x, A, group_metadata)
     res = (x, A, group_sizes)
     return y, res
 
@@ -188,7 +236,7 @@ def _gpu_trans_ragged_dot_kernel(
     # outputs
     A_bar_ref,  # [g, k, n]
     # static problem shapes
-    size: ProblemSizes,
+    size: RaggedDotSizes,
     block: BlockSizes,  # hyperparameters
     compute_dtype: Optional["jnp.dtype"] = None,
     acc_dtype: "jnp.dtype" = jnp.float32,
@@ -204,7 +252,7 @@ def _gpu_trans_ragged_dot_kernel(
     @pl.when(group_sz > 0)
     def _():
         # row index into lhs and output
-        start_ridx = jnp.where(pid.gi == 0, 0, group_offset_ref[jnp.maximum(pid.gi - 1, 0)])
+        start_ridx = jnp.where(pid.gi == 0, 0, group_offset_ref[pid.gi])
 
         k_idx = pl.ds(0, block.k)
         k_mask = (pid.r * block.m + jnp.arange(block.k)) < size.k
@@ -252,7 +300,7 @@ def _gpu_trans_ragged_dot_fwd(
     """Compute grouped matmul on GPU via a Pallas lowering."""
     assert y.ndim == 2 and x.ndim == 2 and x.shape[0] == y.shape[0]
     (m, k), n = x.shape, y.shape[-1]
-    size = ProblemSizes(m=m, k=k, n=n, g=group_sizes.size)
+    size = RaggedDotSizes(m=m, k=k, n=n, g=group_sizes.size)
 
     block_m, block_n = min(block_m, m), min(block_n, n)
 
@@ -262,7 +310,7 @@ def _gpu_trans_ragged_dot_fwd(
         for b, s in zip([block_m, block_k, block_n, block_k], [size.m, size.k, size.n])
     ]
 
-    group_offsets = jnp.cumsum(group_sizes, -1)  # we'll read 1 down always
+    group_offsets = jnp.cumsum(group_sizes) - group_sizes
     in_specs = [
         pl.BlockSpec((size.m, block_k), lambda i, r, c: (0, r)),
         pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
