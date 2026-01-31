@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import itertools
 import math
 import os
@@ -25,7 +26,7 @@ from absl.testing import absltest, parameterized
 from jax.lax import RaggedDotDimensionNumbers
 from scipy.special import softmax
 
-from gpu_ragged_dot import ragged_dot, trans_ragged_dot
+from gpu_ragged_dot import CHUNK_M, gmm, tgmm
 
 GMM_DIM_NUMS = RaggedDotDimensionNumbers(
     dot_dimension_numbers=(((1,), (1,)), ((), ())), lhs_ragged_dimensions=(0,), rhs_group_dimensions=(0,)
@@ -35,13 +36,13 @@ TGMM_DIM_NUMS = RaggedDotDimensionNumbers(
 )
 
 
-def ragged_dot_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, **kw):
+def gmm_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, **kw):
     assert lhs.ndim == 2 and rhs.ndim == 3
     del kw
     return jax.lax.ragged_dot_general(lhs, rhs, group_sizes, ragged_dot_dimension_numbers=GMM_DIM_NUMS)
 
 
-def trans_ragged_dot_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, **kw):
+def tgmm_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, **kw):
     assert lhs.ndim == rhs.ndim == 2
     del kw
     return jax.lax.ragged_dot_general(lhs, rhs, group_sizes, ragged_dot_dimension_numbers=TGMM_DIM_NUMS)
@@ -90,7 +91,7 @@ def _sampled_product(samples, **kw):
 cases_wrapper = _sampled_product(
     os.getenv("TEST_SAMPLES", 32),
     dtype=[jnp.bfloat16, jnp.float32],
-    m=[128, 256, 171],
+    m=[128, 256, 171],  # CHUNK_M to test row chunking
     k=[256, 512, 58],
     n=[64, 128, 77],
     g=[8, 16],
@@ -98,9 +99,9 @@ cases_wrapper = _sampled_product(
     block_k=[16, 32, 64],
     block_n=[16, 32, 64],
     fill_in=[1.0, 0.7, 0.5],
-    # fill_in=[1.0],
     seed=[0, 1],
     random_inputs=[True, False],
+    chunk_m=[8, CHUNK_M],
 )
 
 
@@ -116,25 +117,25 @@ class GMMTests(parameterized.TestCase):
         return lhs, rhs, dout, group_sizes, target_m
 
     @cases_wrapper
-    def test_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs):
+    def test_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs, chunk_m):
         lhs, rhs, _, group_sizes, target_m = self.generate_inputs(
             seed, m, k, n, g, fill_in, dtype, random=random_inputs
         )
-        y = jax.jit(partial(ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(lhs, rhs, group_sizes)
-        y_ref = jax.jit(ragged_dot_ref)(lhs, rhs, group_sizes)
+        y = jax.jit(partial(gmm, block_m=block_m, block_k=block_k, block_n=block_n, chunk_m=chunk_m))(lhs, rhs, group_sizes)
+        y_ref = jax.jit(gmm_ref)(lhs, rhs, group_sizes)
         err = err_fn(y, y_ref, axis=-1, mask=jnp.arange(m) < target_m)
         eps = 5e-3 if jnp.dtype(dtype).name == "bfloat16" else 5e-4
         self.assertLess(jnp.max(err), eps)
 
     @cases_wrapper
-    def test_ragged_dot_diff(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs):
+    def test_ragged_dot_diff(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs, chunk_m):
         lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(
             seed, m, k, n, g, fill_in, dtype, random=random_inputs
         )
         o, vjp_fn = jax.vjp(
-            partial(ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n, group_sizes=group_sizes), lhs, rhs
+            partial(gmm, block_m=block_m, block_k=block_k, block_n=block_n, chunk_m=chunk_m, group_sizes=group_sizes), lhs, rhs
         )
-        o_ref, vjp_ref_fn = jax.vjp(partial(ragged_dot_ref, group_sizes=group_sizes), lhs, rhs)
+        o_ref, vjp_ref_fn = jax.vjp(partial(gmm_ref, group_sizes=group_sizes), lhs, rhs)
         dlhs, drhs = vjp_fn(dout)
         dlhs_ref, drhs_ref = vjp_ref_fn(dout)
         o_err = err_fn(o, o_ref, axis=-1, mask=jnp.arange(m) < target_m)
@@ -147,17 +148,17 @@ class GMMTests(parameterized.TestCase):
 
     @cases_wrapper
     def test_ragged_dot_diff_with_trans_A(
-        self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs
+        self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs, chunk_m
     ):
         lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(
             seed, m, k, n, g, fill_in, dtype, random=random_inputs
         )
         rhs = rhs.mT
         fn = partial(
-            ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n, group_sizes=group_sizes, trans_rhs=True
+            gmm, block_m=block_m, block_k=block_k, block_n=block_n, group_sizes=group_sizes, trans_rhs=True, chunk_m=chunk_m
         )
         o, vjp_fn = jax.vjp(fn, lhs, rhs)
-        o_ref, vjp_ref_fn = jax.vjp(partial(ragged_dot_ref, group_sizes=group_sizes), lhs, rhs.mT)
+        o_ref, vjp_ref_fn = jax.vjp(partial(gmm_ref, group_sizes=group_sizes), lhs, rhs.mT)
         dlhs, drhs = vjp_fn(dout)
         dlhs_ref, drhs_ref = vjp_ref_fn(dout)
         drhs_ref = drhs_ref.mT
@@ -170,14 +171,14 @@ class GMMTests(parameterized.TestCase):
         self.assertLess(jnp.max(drhs_err), eps)
 
     @cases_wrapper
-    def test_trans_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs):
+    def test_trans_ragged_dot(self, dtype, m, k, n, g, block_m, block_k, block_n, fill_in, seed, random_inputs, chunk_m):
         lhs, rhs, dout, group_sizes, target_m = self.generate_inputs(
             seed, m, k, n, g, fill_in, dtype, random=random_inputs
         )
-        y = jax.jit(partial(trans_ragged_dot, block_m=block_m, block_k=block_k, block_n=block_n))(
+        y = jax.jit(partial(tgmm, block_m=block_m, block_k=block_k, block_n=block_n, chunk_m=chunk_m))(
             lhs, dout, group_sizes
         )
-        y_ref = jax.jit(trans_ragged_dot_ref)(lhs, dout, group_sizes)
+        y_ref = jax.jit(tgmm_ref)(lhs, dout, group_sizes)
         err = err_fn(y, y_ref, axis=(-1, -2), mask=group_sizes != 0)
         eps = 2e-3 if jnp.dtype(dtype).name == "bfloat16" else 1e-4
         self.assertLess(jnp.max(err), eps)

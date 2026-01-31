@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import tune_jax
 from jax import random
 
-from gpu_ragged_dot import ragged_dot, trans_ragged_dot
+from gpu_ragged_dot import gmm, tgmm
 
 # a simple tuninig example #############################################################################################
 
@@ -37,11 +37,14 @@ def main():
     rhs = random.normal(next(keys), (g, k, n), dtype=dtype)
     dout = random.normal(next(keys), (m, n), dtype=dtype)
 
+
     group_sizes = jnp.round((m - 2) * jax.nn.softmax(1e0 * random.normal(next(keys), (g,)), -1)).astype(jnp.int32)
     while jnp.sum(group_sizes) != m:
         idx = jnp.argmax(group_sizes)
         group_sizes = group_sizes.at[idx].set(group_sizes[idx] + (m - jnp.sum(group_sizes)))
     assert jnp.sum(group_sizes) <= m
+
+    gmm(lhs, rhs, group_sizes)
 
     hyperparams = dict(
         block_m=[32, 64, 128, 256],
@@ -52,7 +55,7 @@ def main():
     err_fn = lambda x, y, axis=-1: jnp.linalg.norm(x - y, axis=axis) / jnp.maximum(jnp.linalg.norm(y, axis=axis), 1e-7)
 
     # tune the fwd function ############################################################################################
-    fn = tune_jax.tune(jax.jit(ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
+    fn = tune_jax.tune(jax.jit(gmm, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
     o_ref = jax.lax.ragged_dot(lhs, rhs, group_sizes)
     o = jax.block_until_ready(fn(lhs, rhs, group_sizes))
     with jax.profiler.trace("/tmp/profiles"):
@@ -66,7 +69,7 @@ def main():
     gmm_optimal_hyperparams = dict(fn.optimal_hyperparams)
 
     # tune the combined trans_ragged_dot ###############################################################################
-    fn = tune_jax.tune(jax.jit(trans_ragged_dot, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
+    fn = tune_jax.tune(jax.jit(tgmm, static_argnames=hyperparams.keys()), hyperparams=hyperparams)
     drhs = jax.block_until_ready(fn(lhs, dout, group_sizes))
     drhs_ref = jax.vjp(lambda rhs: jax.lax.ragged_dot(lhs, rhs, group_sizes), rhs)[1](dout)[0]
     drhs_err = err_fn(drhs, drhs_ref, axis=(-1, -2))
@@ -80,8 +83,8 @@ def main():
 
     # tune combined ####################################################################################################
     def combined_fn(lhs, rhs, group_sizes, **kw):
-        y = ragged_dot(lhs, rhs, group_sizes, **kw)
-        dlhs, drhs = jax.grad(lambda lhs_, rhs_, gs_: jnp.sum(ragged_dot(lhs_, rhs_, gs_, **kw)), argnums=(0, 1))(
+        y = gmm(lhs, rhs, group_sizes, **kw)
+        dlhs, drhs = jax.grad(lambda lhs_, rhs_, gs_: jnp.sum(gmm(lhs_, rhs_, gs_, **kw)), argnums=(0, 1))(
             lhs, rhs, group_sizes
         )
         return jnp.sum(drhs.astype(jnp.float32)) + jnp.sum(dlhs.astype(jnp.float32)) + jnp.sum(y.astype(jnp.float32))
@@ -98,7 +101,7 @@ def main():
     print("-" * 80)
     print("-" * 80)
     print("Summary:")
-    print(f"gmm/ragged_dot optimal hyperparameters:          {gmm_optimal_hyperparams}")
+    print(f"gmm optimal hyperparameters:                     {gmm_optimal_hyperparams}")
     print(f"gmm and its derivatives optimal hyperparameters: {combined_optimal_hyperparams}")
     print("-" * 80)
     print("-" * 80)

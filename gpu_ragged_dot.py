@@ -27,7 +27,7 @@ if CompilerParams is None:
         "Could not find CompilerParams in `jax.experimental.pallas.triton`. Upgrade to an newer JAX version please."
     )
 
-__all__ = ["ragged_dot", "trans_ragged_dot", "gmm", "tgmm"]
+__all__ = ["gmm", "tgmm", "ragged_dot", "trans_ragged_dot"]
 
 # kernel ###############################################################################################################
 
@@ -58,7 +58,7 @@ class BlockSizes(NamedTuple):
 
 
 class GMMGroupLookupMetadata(NamedTuple):
-    """Metadata for splitting large groups into smaller chunks for ragged_dot, trans_ragged_dot doesn't use this."""
+    """Metadata for splitting large groups into smaller chunks for gmm, tgmm doesn't use this."""
 
     group_sizes: jax.Array  # the regular group sizes
     group_offsets: jax.Array  # the group offsets
@@ -68,7 +68,7 @@ class GMMGroupLookupMetadata(NamedTuple):
 
 
 def _make_gmm_group_metadata(group_sizes: jax.Array, m: int, chunk_m: int) -> GMMGroupLookupMetadata:
-    """Split large groups into chunks to let several SMs work on one group. For ragged_dot, not trans_ragged_dot."""
+    """Split large groups into chunks to let several SMs work on one group. For gmm, not tgmm."""
     g: int = group_sizes.size
     blocks_per_group = (group_sizes + chunk_m - 1) // chunk_m  # ceil div of group sizes into chunks
 
@@ -90,7 +90,7 @@ def _make_gmm_group_metadata(group_sizes: jax.Array, m: int, chunk_m: int) -> GM
     )
 
 
-def _gpu_ragged_dot_kernel(
+def _gpu_gmm_kernel(
     # inputs
     x_ref,  # [m, k]
     A_ref,  # [k, n] or [n, k]
@@ -126,7 +126,6 @@ def _gpu_ragged_dot_kernel(
         def outer_compute(r_offset, _):
             ridx = start_ridx + r_offset * block.m  # r_offset is 0,1,2,... need to map it to actual row indices
             lhs_rows_mask = (r_offset * block.m + jnp.arange(block.m)) < group_sz
-            # lhs_rows_idx = pl.ds(pl.multiple_of((ridx // 32) * 32, 32), block.m)
             lhs_rows_idx = pl.ds(ridx, block.m)
             rhs_cols_idx = pl.ds(0, block.n)
             rhs_cols_mask = (block.n * pid.j + jnp.arange(block.n)) < size.n
@@ -135,11 +134,14 @@ def _gpu_ragged_dot_kernel(
                 inner_idx = pl.ds(k * block.k, block.k)
                 inner_mask = (k * block.k + jnp.arange(block.k)) < size.k
                 _load = partial(plgpu.load, other=0)
-                x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=lhs_rows_mask[:, None] & inner_mask[None, :])
+                mask = lhs_rows_mask[:, None] & inner_mask[None, :]
+                x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=mask)
                 if not trans_rhs:
-                    A = _load(A_ref.at[inner_idx, rhs_cols_idx], mask=inner_mask[:, None] & rhs_cols_mask[None, :])
+                    mask = inner_mask[:, None] & rhs_cols_mask[None, :]
+                    A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
                 else:
-                    A = _load(A_ref.at[rhs_cols_idx, inner_idx], mask=rhs_cols_mask[:, None] & inner_mask[None, :])
+                    mask = rhs_cols_mask[:, None] & inner_mask[None, :]
+                    A = _load(A_ref.at[pid.gi, rhs_cols_idx, inner_idx], mask=mask)
                 return acc + _dot_fn(x.astype(compute_dtype), A.astype(compute_dtype)).astype(acc.dtype)
 
             acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
@@ -152,25 +154,22 @@ def _gpu_ragged_dot_kernel(
 
     # zero out memory past sum(group_sizes) if we're the last kernel along m
     last_offset = group_metadata_ref.group_offsets[size.g - 1] + group_metadata_ref.group_sizes[size.g - 1]
-
     @pl.when((pid.i == group_metadata_ref.total_row_its[...] - 1) & (last_offset < size.m))
     def _():
         col_mask = (block.n * pid.j + jnp.arange(block.n)) < size.n
-
         def set_zero(i, _):
             row_mask = (last_offset + i * block.m + jnp.arange(block.m)) < size.m
             idx = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
             mask = row_mask[:, None] & col_mask[None, :]
             plgpu.store(y_ref.at[*idx], jnp.zeros((block.m, block.n), dtype=y_ref.dtype), mask=mask)
-
         jax.lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
 
 
 # main routine #########################################################################################################
 
 
-@partial(jax.jit, static_argnums=list(range(3, 12)))
-def _gpu_ragged_dot_fwd(
+@partial(jax.jit, static_argnums=list(range(3, 13)))
+def _gpu_gmm_fwd(
     x: jax.Array,  # [m, k]
     A: jax.Array,  # [g, k, n]
     group_sizes: jax.Array,  # [g]
@@ -183,6 +182,7 @@ def _gpu_ragged_dot_fwd(
     acc_dtype: Optional["jnp.dtype"] = jnp.float32,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    chunk_m: int = CHUNK_M,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
     """Compute grouped matmul on GPU via a Pallas lowering."""
     assert A.ndim == 3 and x.ndim == 2, f"but {A.ndim=} {x.ndim=}"
@@ -196,12 +196,12 @@ def _gpu_ragged_dot_fwd(
     ]
     block_k, block_n = max(block_k, 16), max(block_n, 16)
 
-    A_spec = pl.BlockSpec((None, size.k, block_n), lambda i, j: (i, 0, j))
+    A_spec = pl.BlockSpec((size.g, size.k, block_n), lambda i, j: (0, 0, j))
     if trans_rhs:  # transposed spec
-        A_spec = pl.BlockSpec((None, block_n, size.k), lambda i, j: (i, j, 0))
+        A_spec = pl.BlockSpec((size.g, block_n, size.k), lambda i, j: (0, j, 0))
 
-    chunk_m = CHUNK_M
     group_metadata = _make_gmm_group_metadata(group_sizes=group_sizes, m=size.m, chunk_m=chunk_m)
+
     in_specs = [
         pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
         A_spec,
@@ -213,22 +213,22 @@ def _gpu_ragged_dot_fwd(
     grid = (grid_upper_bound, pl.cdiv(size.n, block_n))
     block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
     other_kws = dict(compute_dtype=compute_dtype, acc_dtype=acc_dtype, trans_rhs=trans_rhs, chunk_m=chunk_m)
-    with jax.named_scope("gpu_ragged_dot"):
+    with jax.named_scope("gpu_gmm"):
         y = pl.pallas_call(
-            partial(_gpu_ragged_dot_kernel, size=size, block=block_sizes, **other_kws),
+            partial(_gpu_gmm_kernel, size=size, block=block_sizes, **other_kws),
             out_shape=out_shape,
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
             interpret=interpret,
             compiler_params=CompilerParams(num_warps=num_warps, num_stages=num_stages),  # ty: ignore[call-non-callable]
-            name="gpu_ragged_dot",
+            name="gpu_gmm",
         )(x, A, group_metadata)
     res = (x, A, group_sizes)
     return y, res
 
 
-def _gpu_trans_ragged_dot_kernel(
+def _gpu_tgmm_kernel(
     # inputs
     x_ref,  # [m, k]
     y_ref,  # [k, n]
@@ -284,8 +284,8 @@ def _gpu_trans_ragged_dot_kernel(
 # main routine #########################################################################################################
 
 
-@partial(jax.jit, static_argnums=list(range(3, 11)))
-def _gpu_trans_ragged_dot_fwd(
+@partial(jax.jit, static_argnums=list(range(3, 12)))
+def _gpu_tgmm_fwd(
     x: jax.Array,  # [m, k]
     y: jax.Array,  # [m, n]
     group_sizes: jax.Array,  # [g]
@@ -297,8 +297,10 @@ def _gpu_trans_ragged_dot_fwd(
     acc_dtype: Optional["jnp.dtype"] = jnp.float32,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    chunk_m: int = CHUNK_M,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
     """Compute grouped matmul on GPU via a Pallas lowering."""
+    del chunk_m
     assert y.ndim == 2 and x.ndim == 2 and x.shape[0] == y.shape[0]
     (m, k), n = x.shape, y.shape[-1]
     size = RaggedDotSizes(m=m, k=k, n=n, g=group_sizes.size)
@@ -325,16 +327,16 @@ def _gpu_trans_ragged_dot_fwd(
 
     block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
     dtype_spec = dict(compute_dtype=compute_dtype, acc_dtype=acc_dtype)
-    with jax.named_scope("gpu_trans_ragged_dot"):
+    with jax.named_scope("gpu_tgmm"):
         y = pl.pallas_call(
-            partial(_gpu_trans_ragged_dot_kernel, size=size, block=block_sizes, **dtype_spec),
+            partial(_gpu_tgmm_kernel, size=size, block=block_sizes, **dtype_spec),
             out_shape=out_shape,
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
             interpret=interpret,
             compiler_params=CompilerParams(num_warps=num_warps, num_stages=num_stages),  # ty: ignore[call-non-callable]
-            name="gpu_trans_ragged_dot",
+            name="gpu_tgmm",
         )(x, y, group_sizes, group_offsets)
     res = (x, y, group_sizes)
     return y, res
@@ -351,12 +353,13 @@ NONDIFF_ARGNAMES = (
     "acc_dtype",
     "num_warps",
     "num_stages",
+    "chunk_m",
 )
 
 
 @partial(jax.custom_vjp, nondiff_argnames=NONDIFF_ARGNAMES + ("trans_rhs",))
-@partial(jax.jit, static_argnums=list(range(3, 12)))
-def ragged_dot(
+@partial(jax.jit, static_argnums=list(range(3, 13)))
+def gmm(
     x: jax.Array,  # [m, k]
     A: jax.Array,  # [g, k, n]
     group_sizes: jax.Array,  # [g]
@@ -369,14 +372,15 @@ def ragged_dot(
     acc_dtype: Optional["jnp.dtype"] = jnp.float32,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    chunk_m: int = CHUNK_M,
 ) -> jax.Array:
     """Ragged dot corresponding to jax.lax.ragged_dot (m, k) x (g, k, n) -> (m, n)"""
-    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret)
+    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret, chunk_m=chunk_m)
     kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
-    return _gpu_ragged_dot_fwd(x, A, group_sizes, **kw, trans_rhs=trans_rhs)[0]
+    return _gpu_gmm_fwd(x, A, group_sizes, **kw, trans_rhs=trans_rhs)[0]
 
 
-def _gpu_ragged_dot_bwd(
+def _gpu_gmm_bwd(
     block_m: int,
     block_k: int,
     block_n: int,
@@ -386,24 +390,25 @@ def _gpu_ragged_dot_bwd(
     acc_dtype: Optional["jnp.dtype"],
     num_warps: int | None,
     num_stages: int | None,
+    chunk_m: int,
     res: tuple[jax.Array, jax.Array, jax.Array],
     do: jax.Array,
 ):
-    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret)
+    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret, chunk_m=chunk_m)
     kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
     x, A, group_sizes = res
-    dx = ragged_dot(do, A, group_sizes, **kw, trans_rhs=not trans_rhs)
-    dA = trans_ragged_dot(x, do, group_sizes, **kw) if not trans_rhs else trans_ragged_dot(do, x, group_sizes, **kw)
+    dx = gmm(do, A, group_sizes, **kw, trans_rhs=not trans_rhs)
+    dA = tgmm(x, do, group_sizes, **kw) if not trans_rhs else tgmm(do, x, group_sizes, **kw)
     return dx, dA, None
 
 
-ragged_dot.defvjp(_gpu_ragged_dot_fwd, _gpu_ragged_dot_bwd)
-gmm = ragged_dot
+gmm.defvjp(_gpu_gmm_fwd, _gpu_gmm_bwd)
+ragged_dot = gmm
 
 
 @partial(jax.custom_vjp, nondiff_argnames=NONDIFF_ARGNAMES)
-@partial(jax.jit, static_argnums=list(range(3, 11)))
-def trans_ragged_dot(
+@partial(jax.jit, static_argnums=list(range(3, 12)))
+def tgmm(
     x: jax.Array,  # [m, k]
     y: jax.Array,  # [m, n]
     group_sizes: jax.Array,  # [g]
@@ -415,14 +420,15 @@ def trans_ragged_dot(
     acc_dtype: Optional["jnp.dtype"] = jnp.float32,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    chunk_m: int = CHUNK_M,
 ) -> jax.Array:
     """Tranposed ragged dot corresponding to transpose of ragged dot wrt A argument (m, k) x (m, n) -> (g, k, n)"""
-    kw = dict(block_m=block_m, block_n=block_n, block_k=block_k, interpret=interpret)
+    kw = dict(block_m=block_m, block_n=block_n, block_k=block_k, interpret=interpret, chunk_m=chunk_m)
     kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
-    return _gpu_trans_ragged_dot_fwd(x, y, group_sizes, **kw)[0]
+    return _gpu_tgmm_fwd(x, y, group_sizes, **kw)[0]
 
 
-def _gpu_trans_ragged_dot_bwd(
+def _gpu_tgmm_bwd(
     group_sizes: jax.Array,  # [g]
     block_m: int,
     block_k: int,
@@ -432,16 +438,17 @@ def _gpu_trans_ragged_dot_bwd(
     acc_dtype: Optional["jnp.dtype"],
     num_warps: int | None,
     num_stages: int | None,
+    chunk_m: int,
     res: tuple[jax.Array, jax.Array, jax.Array],
     do: jax.Array,
 ):
-    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret)
+    kw = dict(block_m=block_m, block_k=block_k, block_n=block_n, interpret=interpret, chunk_m=chunk_m)
     kw = dict(kw, compute_dtype=compute_dtype, acc_dtype=acc_dtype, num_warps=num_warps, num_stages=num_stages)
     x, y, group_sizes = res
-    dx = ragged_dot(y, do, group_sizes, **kw, trans_rhs=True)
-    dy = trans_ragged_dot(x, do, group_sizes, **kw)
+    dx = gmm(y, do, group_sizes, **kw, trans_rhs=True)
+    dy = tgmm(x, do, group_sizes, **kw)
     return dx, dy, None
 
 
-trans_ragged_dot.defvjp(_gpu_trans_ragged_dot_fwd, _gpu_trans_ragged_dot_bwd)
-tgmm = trans_ragged_dot
+tgmm.defvjp(_gpu_tgmm_fwd, _gpu_tgmm_bwd)
+trans_ragged_dot = tgmm
