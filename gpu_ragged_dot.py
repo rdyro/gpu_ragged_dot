@@ -126,6 +126,7 @@ def _gpu_ragged_dot_kernel(
         def outer_compute(r_offset, _):
             ridx = start_ridx + r_offset * block.m  # r_offset is 0,1,2,... need to map it to actual row indices
             lhs_rows_mask = (r_offset * block.m + jnp.arange(block.m)) < group_sz
+            # lhs_rows_idx = pl.ds(pl.multiple_of((ridx // 32) * 32, 32), block.m)
             lhs_rows_idx = pl.ds(ridx, block.m)
             rhs_cols_idx = pl.ds(0, block.n)
             rhs_cols_mask = (block.n * pid.j + jnp.arange(block.n)) < size.n
@@ -255,7 +256,7 @@ def _gpu_trans_ragged_dot_kernel(
         start_ridx = jnp.where(pid.gi == 0, 0, group_offset_ref[pid.gi])
 
         k_idx = pl.ds(0, block.k)
-        k_mask = (pid.r * block.m + jnp.arange(block.k)) < size.k
+        k_mask = (pid.r * block.k + jnp.arange(block.k)) < size.k
         cols_idx = pl.ds(0, block.n)
         cols_mask = (pid.c * block.n + jnp.arange(block.n)) < size.n
 
