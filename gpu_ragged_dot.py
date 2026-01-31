@@ -27,7 +27,7 @@ if CompilerParams is None:
         "Could not find CompilerParams in `jax.experimental.pallas.triton`. Upgrade to an newer JAX version please."
     )
 
-__all__ = ["ragged_dot", "trans_ragged_dot"]
+__all__ = ["ragged_dot", "trans_ragged_dot", "gmm", "tgmm"]
 
 # kernel ###############################################################################################################
 
@@ -398,6 +398,7 @@ def _gpu_ragged_dot_bwd(
 
 
 ragged_dot.defvjp(_gpu_ragged_dot_fwd, _gpu_ragged_dot_bwd)
+gmm = ragged_dot
 
 
 @partial(jax.custom_vjp, nondiff_argnames=NONDIFF_ARGNAMES)
@@ -443,3 +444,4 @@ def _gpu_trans_ragged_dot_bwd(
 
 
 trans_ragged_dot.defvjp(_gpu_trans_ragged_dot_fwd, _gpu_trans_ragged_dot_bwd)
+tgmm = trans_ragged_dot
